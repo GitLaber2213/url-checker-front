@@ -1,7 +1,6 @@
 import { useEffect, useRef } from 'react'
 import {
   parseJobDetail,
-  selectShouldStreamActiveJob,
   shouldCloseJobStream,
   useJobsStore,
   type JobDetail,
@@ -9,12 +8,68 @@ import {
 } from '@entities/job'
 import { jobsStreamApi, parseSseData } from '@shared/api/jobsStreamApi'
 
+let currentSource: EventSource | null = null
+let currentSourceJobId: string | null = null
+
+function stopJobStream() {
+  if (currentSource) {
+    currentSource.close()
+    currentSource = null
+    currentSourceJobId = null
+  }
+}
+
+function connectJobStream(jobId: string) {
+  if (currentSourceJobId === jobId && currentSource) {
+    return
+  }
+
+  stopJobStream()
+
+  const source = new EventSource(jobsStreamApi.jobUrl(jobId))
+  currentSource = source
+  currentSourceJobId = jobId
+
+  let closed = false
+
+  const close = () => {
+    if (closed) {
+      return
+    }
+    closed = true
+    source.close()
+    if (currentSource === source) {
+      currentSource = null
+      currentSourceJobId = null
+    }
+  }
+
+  source.onmessage = (event) => {
+    if (closed) {
+      return
+    }
+
+    const data = parseSseData<JobDetail | JobSummary>(event.data)
+    if (!data) {
+      return
+    }
+
+    useJobsStore.getState().applyJobUpdate(data)
+
+    if (shouldCloseJobStream(parseJobDetail(data))) {
+      close()
+    }
+  }
+
+  source.onerror = () => {
+    close()
+  }
+}
+
 export function useJobsSse() {
   const activeJobId = useJobsStore((state) => state.activeJobId)
-  const shouldStream = useJobsStore(selectShouldStreamActiveJob)
+  const streamJobId = useJobsStore((state) => state.streamJobId)
   const loadJobs = useJobsStore((state) => state.loadJobs)
-  const applyJobUpdate = useJobsStore((state) => state.applyJobUpdate)
-  const setDetailError = useJobsStore((state) => state.setDetailError)
   const initRef = useRef(false)
 
   useEffect(() => {
@@ -26,43 +81,13 @@ export function useJobsSse() {
   }, [loadJobs])
 
   useEffect(() => {
-    if (!activeJobId || !shouldStream) {
+    if (!streamJobId || streamJobId !== activeJobId) {
+      stopJobStream()
       return
     }
 
-    const source = new EventSource(jobsStreamApi.jobUrl(activeJobId))
-    let closed = false
+    connectJobStream(streamJobId)
 
-    source.onmessage = (event) => {
-      if (closed) {
-        return
-      }
-
-      const data = parseSseData<JobDetail | JobSummary>(event.data)
-      if (!data) {
-        return
-      }
-
-      applyJobUpdate(data)
-
-      if (shouldCloseJobStream(parseJobDetail(data))) {
-        closed = true
-        source.close()
-      }
-    }
-
-    source.onerror = () => {
-      if (closed) {
-        return
-      }
-      closed = true
-      source.close()
-      setDetailError('Потеряно SSE-соединение с заданием')
-    }
-
-    return () => {
-      closed = true
-      source.close()
-    }
-  }, [activeJobId, applyJobUpdate, setDetailError, shouldStream])
+    return stopJobStream
+  }, [activeJobId, streamJobId])
 }

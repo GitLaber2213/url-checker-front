@@ -7,10 +7,10 @@ import {
   countProcessedUrls,
   detailFromSummary,
   getJobStatusFromState,
-  isTerminalJobStatus,
   JOBS_PAGE_SIZE,
   parseJobDetail,
   shouldCloseJobStream,
+  shouldStartJobStream,
   summaryFromDetail,
 } from './types'
 
@@ -23,6 +23,7 @@ export interface JobsState {
   listLoading: boolean
   listError: string | null
   activeJobId: string | null
+  streamJobId: string | null
   activeJobDetail: JobDetail | null
   detailCache: Record<string, JobDetail>
   detailLoading: boolean
@@ -48,6 +49,10 @@ function getErrorMessage(error: unknown, fallback: string): string {
   return error instanceof Error ? error.message : fallback
 }
 
+function calcTotalPages(total: number, limit: number): number {
+  return total > 0 ? Math.ceil(total / limit) : 0
+}
+
 function upsertJobSummary(list: JobSummary[], job: JobSummary): JobSummary[] {
   const index = list.findIndex((item) => item.id === job.id)
   if (index === -1) {
@@ -56,6 +61,14 @@ function upsertJobSummary(list: JobSummary[], job: JobSummary): JobSummary[] {
   const next = [...list]
   next[index] = job
   return next
+}
+
+function prependJobSummary(
+  list: JobSummary[],
+  job: JobSummary,
+  limit: number,
+): JobSummary[] {
+  return [job, ...list.filter((item) => item.id !== job.id)].slice(0, limit)
 }
 
 function cacheDetail(
@@ -87,6 +100,7 @@ export const useJobsStore = create<JobsState & JobsActions>((set, get) => ({
   listLoading: false,
   listError: null,
   activeJobId: null,
+  streamJobId: null,
   activeJobDetail: null,
   detailCache: {},
   detailLoading: false,
@@ -101,13 +115,20 @@ export const useJobsStore = create<JobsState & JobsActions>((set, get) => ({
       return
     }
 
-    const detail = resolveJobDetail(get(), jobId)
-    const summary = get().list.find((job) => job.id === jobId)
+    const state = get()
+    const detail = resolveJobDetail(state, jobId)
+    const summary = state.list.find((job) => job.id === jobId)
     const isActive =
       summary?.status === 'pending' || summary?.status === 'in_progress'
+    const resolvedDetail =
+      detail ?? (summary ? detailFromSummary(summary) : null)
+    const streamJobId = shouldStartJobStream(summary, resolvedDetail)
+      ? jobId
+      : null
 
     set({
       activeJobId: jobId,
+      streamJobId,
       activeJobDetail: detail,
       detailError: null,
       detailLoading: detail == null && isActive,
@@ -149,20 +170,36 @@ export const useJobsStore = create<JobsState & JobsActions>((set, get) => ({
     const detail = parseJobDetail(rawDetail)
     const summary = summaryFromDetail(detail)
 
-    set((state) => ({
-      detailLoading: false,
-      detailError: null,
-      detailCache: cacheDetail(state.detailCache, detail),
-      activeJobDetail:
-        state.activeJobId === detail.id ? detail : state.activeJobDetail,
-      list: state.list.some((job) => job.id === detail.id)
-        ? upsertJobSummary(state.list, summary)
-        : state.list,
-    }))
+    set((state) => {
+      const inList = state.list.some((job) => job.id === detail.id)
+      const listTotal = inList ? state.listTotal : state.listTotal + 1
+      const list =
+        inList || state.listPage !== 1
+          ? upsertJobSummary(state.list, summary)
+          : prependJobSummary(state.list, summary, state.listLimit)
+      const streamDone =
+        state.streamJobId === detail.id && shouldCloseJobStream(detail)
+
+      return {
+        detailLoading: false,
+        detailError: null,
+        streamJobId: streamDone ? null : state.streamJobId,
+        detailCache: cacheDetail(state.detailCache, detail),
+        activeJobDetail:
+          state.activeJobId === detail.id ? detail : state.activeJobDetail,
+        list,
+        listTotal,
+        listTotalPages: calcTotalPages(listTotal, state.listLimit),
+      }
+    })
   },
 
   setDetailError: (message) => {
-    set({ detailError: message, detailLoading: false })
+    set({
+      detailError: message,
+      detailLoading: false,
+      streamJobId: message ? null : get().streamJobId,
+    })
   },
 
   createJob: async (urls, proxy) => {
@@ -178,14 +215,27 @@ export const useJobsStore = create<JobsState & JobsActions>((set, get) => ({
         urls: pendingUrls,
       }
 
-      set({
-        createLoading: false,
-        activeJobId: jobId,
-        activeJobDetail: optimisticDetail,
-        detailLoading: false,
-        detailCache: cacheDetail(get().detailCache, optimisticDetail),
+      const summary = summaryFromDetail(optimisticDetail)
+
+      set((state) => {
+        const listTotal = state.listTotal + 1
+
+        return {
+          createLoading: false,
+          activeJobId: jobId,
+          streamJobId: jobId,
+          activeJobDetail: optimisticDetail,
+          detailLoading: false,
+          detailCache: cacheDetail(state.detailCache, optimisticDetail),
+          listPage: 1,
+          list:
+            state.listPage === 1
+              ? prependJobSummary(state.list, summary, state.listLimit)
+              : [summary],
+          listTotal,
+          listTotalPages: calcTotalPages(listTotal, state.listLimit),
+        }
       })
-      await get().loadJobs(1)
       return jobId
     } catch (error) {
       set({
@@ -203,6 +253,7 @@ export const useJobsStore = create<JobsState & JobsActions>((set, get) => ({
       const detail = parseJobDetail(raw)
       set((state) => ({
         cancelLoading: false,
+        streamJobId: state.streamJobId === jobId ? null : state.streamJobId,
         detailCache: cacheDetail(state.detailCache, detail),
         activeJobDetail:
           state.activeJobId === jobId ? detail : state.activeJobDetail,
@@ -222,32 +273,8 @@ export const useJobsStore = create<JobsState & JobsActions>((set, get) => ({
 export const selectActiveJobSummaryStatus = (state: JobsState) =>
   getJobStatusFromState(state)
 
-export const selectShouldStreamActiveJob = (state: JobsState) => {
-  if (!state.activeJobId) {
-    return false
-  }
-
-  const summary = state.list.find((job) => job.id === state.activeJobId)
-  const detail =
-    state.activeJobDetail ??
-    state.detailCache[state.activeJobId] ??
-    null
-
-  if (detail && shouldCloseJobStream(detail)) {
-    return false
-  }
-
-  if (summary && isTerminalJobStatus(summary.status)) {
-    return false
-  }
-
-  const status = summary?.status ?? detail?.status
-  if (!status) {
-    return false
-  }
-
-  return status === 'pending' || status === 'in_progress'
-}
+export const selectShouldStreamActiveJob = (state: JobsState) =>
+  state.streamJobId != null && state.streamJobId === state.activeJobId
 
 export const selectActiveJobListCreatedAt = (state: JobsState) => {
   if (!state.activeJobId) {

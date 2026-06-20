@@ -38,6 +38,10 @@ export function countProcessedUrls(job: JobDetail): number {
 }
 
 export function areAllUrlStatusesKnown(job: JobDetail): boolean {
+  if (job.urls.length === 0) {
+    return false
+  }
+
   return job.urls.every((url) =>
     ['success', 'error', 'cancelled'].includes(url.status),
   )
@@ -45,6 +49,29 @@ export function areAllUrlStatusesKnown(job: JobDetail): boolean {
 
 export function shouldCloseJobStream(detail: JobDetail): boolean {
   return isTerminalJobStatus(detail.status) || areAllUrlStatusesKnown(detail)
+}
+
+export function shouldStartJobStream(
+  summary: JobSummary | undefined,
+  detail: JobDetail | null,
+): boolean {
+  if (!summary) {
+    return false
+  }
+
+  if (isTerminalJobStatus(summary.status)) {
+    return false
+  }
+
+  if (summary.status !== 'pending' && summary.status !== 'in_progress') {
+    return false
+  }
+
+  if (detail && shouldCloseJobStream(detail)) {
+    return false
+  }
+
+  return true
 }
 
 export function countProcessedFromStats(stats: JobStats): number {
